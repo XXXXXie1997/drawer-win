@@ -50,7 +50,8 @@ public sealed class TransferService(PersistenceStore store, FileReferenceService
                 bitmap = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad).Frames[0];
             }
         }
-        bitmap ??= data.GetData(DataFormats.Bitmap) as BitmapSource;
+        if (bitmap is null && data.GetData(DataFormats.Bitmap) is BitmapSource clipboardBitmap)
+            bitmap = NormalizeClipboardBitmap(clipboardBitmap);
         if (bitmap is not null)
         {
             var png = new PngBitmapEncoder();
@@ -62,6 +63,21 @@ public sealed class TransferService(PersistenceStore store, FileReferenceService
         string? text = data.GetData(DataFormats.UnicodeText) as string ?? data.GetData(DataFormats.Text) as string;
         if (!string.IsNullOrWhiteSpace(text)) return [new DrawerItem { Kind = ItemKind.Text, Text = text, Frame = new(default, ItemSizing.Text(text)) }];
         return [];
+    }
+    private static BitmapSource NormalizeClipboardBitmap(BitmapSource bitmap)
+    {
+        // Legacy CF_BITMAP producers can leave the unused alpha byte at zero.
+        // Apply this fallback only to clipboard bitmaps, never explicitly supplied PNGs.
+        if (bitmap.Format != System.Windows.Media.PixelFormats.Bgra32 && bitmap.Format != System.Windows.Media.PixelFormats.Pbgra32)
+            return bitmap;
+        int stride = checked(bitmap.PixelWidth * 4);
+        var pixels = new byte[checked(stride * bitmap.PixelHeight)];
+        bitmap.CopyPixels(pixels, stride, 0);
+        for (int i = 3; i < pixels.Length; i += 4)
+            if (pixels[i] != 0) return bitmap;
+        var opaque = BitmapSource.Create(bitmap.PixelWidth, bitmap.PixelHeight, bitmap.DpiX, bitmap.DpiY,
+            System.Windows.Media.PixelFormats.Bgr32, null, pixels, stride);
+        opaque.Freeze(); return opaque;
     }
     public BitmapSource? LoadImage(DrawerItem item, bool fullResolution = false)
     {

@@ -41,6 +41,22 @@ internal static class Program
         var bitmap = BitmapSource.Create(1200, 600, 96, 96, PixelFormats.Bgra32, null, new byte[1200 * 600 * 4], 1200 * 4);
         var input = new DataObject(DataFormats.Bitmap, bitmap);
         var image = transfer.Read(input).Single();
+        tests.Add(("Clipboard screenshots with unused alpha remain visible while PNG transparency is preserved", () =>
+        {
+            byte[] pixels = [30, 60, 120, 0, 90, 150, 210, 0];
+            var screenshot = BitmapSource.Create(2, 1, 96, 96, PixelFormats.Bgra32, null, pixels, 8);
+            var imported = transfer.Read(new DataObject(DataFormats.Bitmap, screenshot)).Single();
+            var loaded = new FormatConvertedBitmap(transfer.LoadImage(imported, true)!, PixelFormats.Bgra32, null, 0);
+            var actual = new byte[8]; loaded.CopyPixels(actual, 8, 0);
+            Assert(actual[3] == 255 && actual[7] == 255 && actual[0] == 30 && actual[6] == 210, "Opaque screenshot retains original RGB pixels after save and reload");
+            var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(screenshot));
+            using var stream = new MemoryStream(); encoder.Save(stream); stream.Position = 0;
+            var transparentData = new DataObject(); transparentData.SetData("PNG", stream); transparentData.SetData(DataFormats.Bitmap, screenshot);
+            var transparent = transfer.Read(transparentData).Single();
+            var transparentLoaded = new FormatConvertedBitmap(transfer.LoadImage(transparent, true)!, PixelFormats.Bgra32, null, 0);
+            transparentLoaded.CopyPixels(actual, 8, 0);
+            Assert(actual[3] == 0 && actual[7] == 0, "Explicit PNG alpha is preserved and takes precedence over bitmap fallback");
+        }));
         var text = new DrawerItem { Kind = ItemKind.Text, Text = "hello 中文", Frame = new(default, new(4, 1)) };
         tests.Add(("Theme palettes keep text readable on tray and handle", () =>
         {
