@@ -16,14 +16,16 @@ public sealed class PersistenceStore
         Root = root;
         Directory.CreateDirectory(ImageDirectory);
     }
-    public (DrawerState State, string? Notice) Load()
+    public (DrawerState State, string? Notice) Load() => LoadState(DrawerState.Deserialize, () => new DrawerState());
+    public (DrawerWorkspace State, string? Notice) LoadWorkspace() => LoadState(DrawerWorkspace.Deserialize, () => new DrawerWorkspace());
+    private (T State, string? Notice) LoadState<T>(Func<string, T> deserialize, Func<T> create)
     {
         foreach (string path in new[] { StatePath, BackupPath })
         {
             if (!File.Exists(path)) continue;
             try
             {
-                var state = DrawerState.Deserialize(File.ReadAllText(path));
+                var state = deserialize(File.ReadAllText(path));
                 if (path == BackupPath)
                 {
                     // Quarantine bad primary; the next save must not replace the valid backup with it.
@@ -33,7 +35,7 @@ public sealed class PersistenceStore
                 return (state, null);
             }
             catch (FutureSchemaException) { ReadOnly = true; throw; }
-            catch (Exception e) when (e is IOException or System.Text.Json.JsonException or UnauthorizedAccessException) { }
+            catch (Exception e) when (e is InvalidDataException or IOException or System.Text.Json.JsonException or UnauthorizedAccessException) { }
         }
         bool corrupt = File.Exists(StatePath) || File.Exists(BackupPath);
         if (corrupt)
@@ -41,13 +43,15 @@ public sealed class PersistenceStore
             foreach (var p in new[] { StatePath, BackupPath })
                 if (File.Exists(p)) File.Move(p, p + ".corrupt-" + DateTime.UtcNow.Ticks);
         }
-        return (new(), corrupt ? "状态恢复失败，已保留损坏文件并使用空抽屉" : null);
+        return (create(), corrupt ? "状态恢复失败，已保留损坏文件并使用空抽屉" : null);
     }
-    public void Save(DrawerState state)
+    public void Save(DrawerState state) => SaveJson(state.Serialize());
+    public void Save(DrawerWorkspace state) { state.Validate(); SaveJson(state.Serialize()); }
+    private void SaveJson(string json)
     {
         if (ReadOnly) throw new IOException("数据处于只读保护状态");
         string temp = StatePath + ".tmp";
-        var bytes = Encoding.UTF8.GetBytes(state.Serialize());
+        var bytes = Encoding.UTF8.GetBytes(json);
         using (var f = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
         {
             f.Write(bytes);
@@ -74,12 +78,14 @@ public sealed class PersistenceStore
         return Path.Combine(ImageDirectory, id + ".png");
     }
     // Called only at startup, when no undo stack or active transfer exists.
-    public void CollectImages(DrawerState current)
+    public void CollectImages(DrawerState current) => CollectImages(current.Items);
+    public void CollectImages(DrawerWorkspace current) => CollectImages(current.Items);
+    private void CollectImages(IEnumerable<DrawerItem> current)
     {
-        var ids = current.Items.Select(i => i.ResourceId).OfType<string>().ToHashSet();
+        var ids = current.Select(i => i.ResourceId).OfType<string>().ToHashSet();
         if (File.Exists(BackupPath))
         {
-            try { ids.UnionWith(DrawerState.Deserialize(File.ReadAllText(BackupPath)).Items.Select(i => i.ResourceId).OfType<string>()); }
+            try { ids.UnionWith(DrawerWorkspace.Deserialize(File.ReadAllText(BackupPath)).Items.Select(i => i.ResourceId).OfType<string>()); }
             catch { return; } // An unreadable backup might still be recoverable; preserve resources.
         }
         if (Directory.EnumerateFiles(Root, "*.corrupt-*").Any()) return;
@@ -87,22 +93,24 @@ public sealed class PersistenceStore
             if (!ids.Contains(Path.GetFileNameWithoutExtension(f))) File.Delete(f);
     }
 
-    public int CollectReferences(DrawerState current, IEnumerable<string>? retainedIds = null)
+    public int CollectReferences(DrawerState current, IEnumerable<string>? retainedIds = null) => CollectReferences(current.Items, retainedIds);
+    public int CollectReferences(DrawerWorkspace current, IEnumerable<string>? retainedIds = null) => CollectReferences(current.Items, retainedIds);
+    private int CollectReferences(IEnumerable<DrawerItem> current, IEnumerable<string>? retainedIds)
     {
         if (ReadOnly || !Directory.Exists(ReferenceDirectory)) return 0;
         // Never traverse a user-replaced references directory or recursively delete anything.
         if ((File.GetAttributes(ReferenceDirectory) & FileAttributes.ReparsePoint) != 0) return 0;
         if (Directory.EnumerateFiles(Root, "*.corrupt-*").Any()) return 0;
         var ids = new HashSet<string>(retainedIds ?? [], StringComparer.OrdinalIgnoreCase);
-        void Retain(DrawerState state) => ids.UnionWith(state.Items.Where(i => i.Kind == ItemKind.FileReference)
+        void Retain(IEnumerable<DrawerItem> items) => ids.UnionWith(items.Where(i => i.Kind == ItemKind.FileReference)
             .Select(i => i.ReferenceId).OfType<string>());
         Retain(current);
         // Include both durable states. A save failure must never destroy a recoverable reference.
         foreach (string path in new[] { StatePath, BackupPath })
         {
             if (!File.Exists(path)) continue;
-            try { Retain(DrawerState.Deserialize(File.ReadAllText(path))); }
-            catch (Exception ex) when (ex is IOException or System.Text.Json.JsonException or UnauthorizedAccessException)
+            try { Retain(DrawerWorkspace.Deserialize(File.ReadAllText(path)).Items); }
+            catch (Exception ex) when (ex is InvalidDataException or IOException or System.Text.Json.JsonException or UnauthorizedAccessException)
             { return 0; }
         }
         int removed = 0;

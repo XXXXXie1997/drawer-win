@@ -24,6 +24,16 @@ internal static class PackageVerification
             if (decoded.Frames[0].PixelWidth != 2) throw new InvalidOperationException("WPF image codecs failed");
             if (DrawerState.Deserialize(new DrawerState().Serialize()).SchemaVersion != DrawerState.CurrentSchema)
                 throw new InvalidOperationException("Embedded core assembly failed");
+            var workspace = new DrawerWorkspace(); workspace.Add(new(DockEdge.Left, .25));
+            if (DrawerWorkspace.Deserialize(workspace.Serialize()).Drawers.Count != 2)
+                throw new InvalidOperationException("Multi-drawer serialization failed");
+            var iconSizes = AppIcon.WindowIcon.Decoder!.Frames.Select(frame => frame.PixelWidth).Order().ToArray();
+            if (!iconSizes.Contains(16) || !iconSizes.Contains(32) || !iconSizes.Contains(256))
+                throw new InvalidOperationException("Embedded application icon sizes are missing");
+            using var trayIcon = AppIcon.CreateTrayIcon();
+            if (trayIcon.Handle == IntPtr.Zero) throw new InvalidOperationException("Notification icon could not be loaded");
+            using var executableIcon = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!);
+            if (executableIcon is null) throw new InvalidOperationException("Executable icon could not be loaded");
             // Single-file hosts may statically link CoreCLR rather than load coreclr.dll.
             string[] nativeModules = Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
                 .Where(m => m.ModuleName.Contains("clr", StringComparison.OrdinalIgnoreCase) ||
@@ -38,7 +48,8 @@ internal static class PackageVerification
                 RuntimeVersion = Environment.Version.ToString(),
                 RuntimeDirectory = RuntimeEnvironment.GetRuntimeDirectory(),
                 NativeModulePaths = nativeModules,
-                WpfText = "passed", WpfPng = "passed", EmbeddedCore = "passed"
+                WpfText = "passed", WpfPng = "passed", EmbeddedCore = "passed", MultiDrawer = "passed",
+                ApplicationIcon = "passed", IconSizes = iconSizes
             }, new JsonSerializerOptions { WriteIndented = true }));
             return 0;
         }

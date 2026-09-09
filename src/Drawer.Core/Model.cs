@@ -42,9 +42,15 @@ public sealed class Viewport
 public sealed class Preferences
 {
     public DockEdge Edge { get; set; }
+    public double EdgePosition { get; set; } = .5;
+    public ShortcutBinding? OpenShortcut { get; set; }
+    public DrawerTheme Theme { get; set; }
+    public Dictionary<DrawerCommand, ShortcutBinding> CommandShortcuts { get; set; } = [];
     public bool SelectionMustContain { get; set; }
     public double Width { get; set; } = 420;
     public double Height { get; set; } = 560;
+    public double? WidthPercent { get; set; }
+    public double? HeightPercent { get; set; }
     public string SettingsPage { get; set; } = "基础";
 }
 public sealed class DrawerState
@@ -75,8 +81,10 @@ public sealed class DrawerState
             throw new InvalidDataException("对象数据无效");
         if (!double.IsFinite(state.Viewport.Zoom) || state.Viewport.Zoom < .35 || state.Viewport.Zoom > 2.5 ||
             !double.IsFinite(state.Viewport.OffsetX) || !double.IsFinite(state.Viewport.OffsetY) ||
-            !double.IsFinite(state.Preferences.Width) || !double.IsFinite(state.Preferences.Height) || !Enum.IsDefined(state.Preferences.Edge))
+            !double.IsFinite(state.Preferences.Width) || !double.IsFinite(state.Preferences.Height) || !Enum.IsDefined(state.Preferences.Edge) ||
+            !double.IsFinite(state.Preferences.EdgePosition) || state.Preferences.EdgePosition is < 0 or > 1)
             throw new InvalidDataException("视口数据无效");
+        DrawerCommands.Validate(state.Preferences);
         return state;
     }
 }

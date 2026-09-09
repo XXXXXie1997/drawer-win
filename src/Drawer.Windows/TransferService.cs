@@ -9,6 +9,7 @@ public sealed class TransferService(PersistenceStore store, FileReferenceService
 {
     public const string SessionFormat = "drawer.source-session.v1";
     public const string ObjectsFormat = "drawer.objects.v1";
+    public const string SourceDrawerFormat = "drawer.source-drawer.v1";
     public string Token { get; } = Guid.NewGuid().ToString();
     private HashSet<string> clipboardReferences = new(StringComparer.OrdinalIgnoreCase);
     private uint clipboardSequence;
@@ -24,6 +25,8 @@ public sealed class TransferService(PersistenceStore store, FileReferenceService
         }
     }
     public bool IsOwn(IDataObject data) => data.GetDataPresent(SessionFormat) && data.GetData(SessionFormat) as string == Token;
+    public bool IsFromDrawer(IDataObject data, Guid drawerId) => IsOwn(data) &&
+        (!data.GetDataPresent(SourceDrawerFormat) || data.GetData(SourceDrawerFormat) as string == drawerId.ToString());
     public bool CanRead(IDataObject data) => data.GetDataPresent(DataFormats.FileDrop) || data.GetDataPresent(DataFormats.Bitmap) || data.GetDataPresent("PNG") || data.GetDataPresent(DataFormats.UnicodeText) || data.GetDataPresent(DataFormats.Text);
     public List<DrawerItem> Read(IDataObject data)
     {
@@ -77,7 +80,7 @@ public sealed class TransferService(PersistenceStore store, FileReferenceService
         }
         catch { return null; }
     }
-    public (DataObject Data, HashSet<Guid> Exported) Build(IEnumerable<DrawerItem> selection, bool dragging)
+    public (DataObject Data, HashSet<Guid> Exported) Build(IEnumerable<DrawerItem> selection, bool dragging, Guid? sourceDrawerId = null)
     {
         var items = selection.ToList();
         var data = new DataObject();
@@ -125,6 +128,7 @@ public sealed class TransferService(PersistenceStore store, FileReferenceService
         }
         data.SetData(ObjectsFormat, Token + "\n" + new DrawerState { Items = items.Where(i => exported.Contains(i.Id)).ToList() }.Serialize());
         if (dragging) data.SetData(SessionFormat, Token);
+        if (dragging && sourceDrawerId is { } drawerId) data.SetData(SourceDrawerFormat, drawerId.ToString());
         data.SetData("Preferred DropEffect", new MemoryStream(BitConverter.GetBytes(1))); // COPY only.
         return (dragging && imagesOnly ? new DataObject(new VirtualFileDataObject(data, virtualFiles)) : data, exported);
     }
