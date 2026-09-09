@@ -15,14 +15,94 @@ internal static class Program
     {
         string root = Path.Combine(Path.GetTempPath(), "drawer-transfer-test-" + Guid.NewGuid().ToString("N"));
         var tests = new List<(string, Action)>();
+        tests.Add(("Startup is opt-in, quotes portable paths and preserves disabled state", StartupChecks.Run));
+        var app = new App { ShutdownMode = ShutdownMode.OnExplicitShutdown };
         var store = new PersistenceStore(root);
         var files = new FileReferenceService(root);
         var transfer = new TransferService(store, files);
+        typeof(App).GetProperty(nameof(App.Store))!.SetValue(app, store);
+        typeof(App).GetProperty(nameof(App.Files))!.SetValue(app, files);
+        tests.Add(("Unified settings save commits label and appearance atomically", () =>
+        {
+            var host = new DrawerHost(app, new DrawerRecord { Label = "原名称" }); app.Drawers.Add(host);
+            try
+            {
+                string before = app.CaptureWorkspace().Serialize();
+                bool invalid = app.ConfigureDrawer(host.Id, p => DrawerSizing.SetPercentages(p, 95, 20), out _, "新名称");
+                Assert(!invalid && app.CaptureWorkspace().Serialize() == before, "Invalid size also leaves the label unchanged");
+                bool saved = app.ConfigureDrawer(host.Id, p => { DrawerSizing.SetPercentages(p, 70, 20); p.Theme = DrawerTheme.Forest; p.SelectionMustContain = true; }, out _, "新名称");
+                var loaded = store.LoadWorkspace().State.Drawers.Single();
+                Assert(saved && host.Label == "新名称" && loaded.Label == host.Label, "Label saved to disk and live state together");
+                Assert(loaded.State.Preferences.WidthPercent == 70 && loaded.State.Preferences.Theme == DrawerTheme.Forest && loaded.State.Preferences.SelectionMustContain, "All pages committed in the same save");
+            }
+            finally { host.Window.CloseDrawer(); app.Drawers.Clear(); }
+        }));
         // A wide PNG catches accidental reuse of downsampled thumbnail data during export.
         var bitmap = BitmapSource.Create(1200, 600, 96, 96, PixelFormats.Bgra32, null, new byte[1200 * 600 * 4], 1200 * 4);
         var input = new DataObject(DataFormats.Bitmap, bitmap);
         var image = transfer.Read(input).Single();
         var text = new DrawerItem { Kind = ItemKind.Text, Text = "hello 中文", Frame = new(default, new(4, 1)) };
+        tests.Add(("Theme palettes keep text readable on tray and handle", () =>
+        {
+            static double Luminance(Brush brush)
+            {
+                var c = ((SolidColorBrush)brush).Color;
+                static double Linear(byte value) { double v = value / 255d; return v <= .04045 ? v / 12.92 : Math.Pow((v + .055) / 1.055, 2.4); }
+                return .2126 * Linear(c.R) + .7152 * Linear(c.G) + .0722 * Linear(c.B);
+            }
+            static double Contrast(Brush a, Brush b) => (Math.Max(Luminance(a), Luminance(b)) + .05) / (Math.Min(Luminance(a), Luminance(b)) + .05);
+            foreach (var theme in Enum.GetValues<DrawerTheme>())
+            {
+                var palette = DrawerPalette.For(theme);
+                Assert(Contrast(palette.Ink, palette.Surface) >= 4.5 && Contrast(palette.Ink, palette.Shell) >= 4.5, "Text readable in every theme");
+                Assert(Contrast(palette.Accent, palette.Surface) >= 3, "Insertion point visible in every theme");
+            }
+        }));
+        tests.Add(("Handle labels stay upright and keep compound emoji intact", () =>
+        {
+            var label = new HandleLabel();
+            foreach (var edge in Enum.GetValues<DockEdge>())
+            {
+                label.Update("文👨‍👩‍👧‍👦A", edge);
+                Assert(label.LayoutTransform.Value.IsIdentity && label.RenderTransform.Value.IsIdentity, "No label rotation on any edge");
+                Assert(label.Text == (edge == DockEdge.Top ? "文👨‍👩‍👧‍👦A" : "文\n👨‍👩‍👧‍👦\nA"), "Side layout preserves grapheme clusters");
+            }
+            label.Update("一二三四五六七八九十", DockEdge.Left);
+            Assert(label.Text.Split('\n').Length == 8 && label.Text.EndsWith("…"), "Long side label fits handle with ellipsis");
+            label.Update("横向名称", DockEdge.Top);
+            Assert(label.Text == "横向名称", "Returning to top restores one line");
+        }));
+        tests.Add(("Invalid rename returns feedback through the app without mutating drawers", () =>
+        {
+            // Construct the actual app boundary without startup, windows, hotkeys or user-data access.
+            var first = new DrawerHost(app, new DrawerRecord { Label = "原名称" });
+            var second = new DrawerHost(app, new DrawerRecord { Label = "另一个" });
+            app.Drawers.Add(first); app.Drawers.Add(second);
+            try
+            {
+                string before = app.CaptureWorkspace().Serialize();
+                foreach (string invalid in new[] { new string('长', 10000), "另一个", "  ", "\uD800" })
+                {
+                    bool success = app.ChangeDrawers(w => w.Rename(first.Id, invalid), out string? error);
+                    Assert(!success && !string.IsNullOrWhiteSpace(error), "Invalid label is reported without escaping the app boundary");
+                    Assert(app.CaptureWorkspace().Serialize() == before, "All drawer data remains unchanged");
+                }
+                var workspace = app.CaptureWorkspace();
+                workspace.Rename(first.Id, string.Concat(Enumerable.Repeat("👨‍👩‍👧‍👦", 8)));
+                Assert(workspace.Drawers[0].Label.Contains("👨‍👩‍👧‍👦"), "Eight visible emoji accepted regardless of UTF-16 length");
+            }
+            finally { first.Window.CloseDrawer(); second.Window.CloseDrawer(); app.Drawers.Clear(); }
+        }));
+        tests.Add(("Animated trays stay attached, preserve host bounds and leave transparent margins", () => AnimationChecks.Run(app)));
+        tests.Add(("Cross-drawer drag preserves mixed types and rejects only its source drawer", () =>
+        {
+            Guid source = Guid.NewGuid(), target = Guid.NewGuid();
+            var output = transfer.Build([text, image], true, source);
+            Assert(transfer.IsFromDrawer(output.Data, source) && !transfer.IsFromDrawer(output.Data, target), "Drag can enter another drawer but not duplicate into source");
+            var incoming = transfer.Read(output.Data);
+            Assert(incoming.Count == 2 && incoming[0].Text == text.Text && incoming[1].ResourceId == image.ResourceId, "Cross-drawer copy preserves text and image resource");
+            Assert(incoming.All(i => i.Id != text.Id && i.Id != image.Id), "Target objects get independent identities");
+        }));
         tests.Add(("Screenshot import and lossless export", () =>
         {
             Assert(image.Kind == ItemKind.EmbeddedImage && image.PixelWidth == 1200, "Import records original size");
@@ -62,7 +142,7 @@ internal static class Program
             var removed = references.Create(source);
             Assert(removed.ReferenceId is not null, "Created a real Shell shortcut");
             string link = Path.Combine(referenceStore.ReferenceDirectory, removed.ReferenceId + ".lnk");
-            Assert(referenceStore.CollectReferences(new()) == 1 && !File.Exists(link), "Orphan Shell shortcut removed");
+            Assert(referenceStore.CollectReferences(new DrawerState()) == 1 && !File.Exists(link), "Orphan Shell shortcut removed");
             Assert(File.ReadAllText(source) == "original file stays", "Shortcut target remains unchanged");
         }));
         tests.Add(("Virtual PNG descriptor and delayed stream", () =>

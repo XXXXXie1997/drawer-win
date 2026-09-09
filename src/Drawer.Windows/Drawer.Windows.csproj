@@ -5,11 +5,13 @@
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>drawer</AssemblyName>
-    <Version>0.1.3</Version>
-    <AssemblyVersion>0.1.3.0</AssemblyVersion>
+    <Version>1.3</Version>
+    <AssemblyVersion>1.3.0.0</AssemblyVersion>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets/DrawerIcon.ico</ApplicationIcon>
     <!-- WPF owns startup/DPI; WinForms is referenced only for the notification icon. -->
     <NoWarn>$(NoWarn);WFO0003</NoWarn>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="../Drawer.Core/Drawer.Core.csproj" /></ItemGroup>
+  <ItemGroup><Resource Include="Assets/DrawerIcon.ico" /><Resource Include="Assets/DrawerWordmark.png" /></ItemGroup>
 </Project>

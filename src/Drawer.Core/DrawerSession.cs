@@ -26,6 +26,17 @@ public sealed class DrawerSession(DrawerState initial)
     }
     public void Refresh() => Changed?.Invoke();
     public void Save() => Committed?.Invoke();
+    public void UpdateInsertionFromSelection(Guid? preferred = null, bool persist = true)
+    {
+        var selected = State.Items.Where(i => Selection.Contains(i.Id)).ToList();
+        if (selected.Count == 0) return;
+        var anchor = selected.FirstOrDefault(i => i.Id == preferred)?.Frame.Origin ??
+            new Cell(selected.Min(i => i.Frame.Origin.X), selected.Min(i => i.Frame.Origin.Y));
+        if (State.InsertionPoint == anchor) return;
+        State.InsertionPoint = anchor;
+        if (persist) Save();
+        Refresh();
+    }
     public void Apply(Action<DrawerState> change)
     {
         string before = State.Serialize();
@@ -59,6 +70,7 @@ public sealed class DrawerSession(DrawerState initial)
             }
             Selection.Clear();
             Selection.UnionWith(batch.Select(i => i.Id));
+            UpdateInsertionFromSelection(persist: false);
         });
     }
     public void Remove(IEnumerable<Guid> ids)
@@ -77,6 +89,7 @@ public sealed class DrawerSession(DrawerState initial)
             var other = s.Items.Where(i => !Selection.Contains(i.Id)).Select(i => i.Frame).ToList();
             var actual = LayoutEngine.FindNearestTranslation(selected.Select(i => i.Frame).ToList(), delta, other);
             foreach (var i in selected) i.Frame = i.Frame.Translate(actual);
+            UpdateInsertionFromSelection(persist: false);
         });
     }
     public void Undo() => Restore(undo, redo);

@@ -3,7 +3,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
-using System.Diagnostics;
+
 
 namespace Drawer.Windows;
 
@@ -11,6 +11,12 @@ public sealed class EdgeWindow : Window
 {
     private readonly App app;
     private readonly Border shell;
+    private readonly Border panel;
+    private readonly Border hint;
+    private readonly Border handleFrame;
+    private readonly System.Windows.Controls.Canvas surface;
+    private readonly HandleLabel handleLabel;
+    private bool retired;
     private readonly Grid content;
     private readonly TextBlock notice;
     private readonly DispatcherTimer timer;
@@ -19,24 +25,37 @@ public sealed class EdgeWindow : Window
     private bool outside;
     private bool focusedPointerEntered;
     private bool dragOver;
-    private enum MotionPhase { None, HandleIn, Expand, CollapseToHandle, HandleOut }
-    private readonly record struct VisualPose(double Width, double Height, double Radius, double ShellOpacity, double ContentOpacity);
-    private VisualPose pose, fromPose, toPose;
-    private MotionPhase motion;
-    private readonly Stopwatch animationClock = new();
-    private double animationDuration;
+    private readonly record struct VisualPose(double Width, double Height, double Radius, double ContentOpacity, double LabelOpacity, double HintOpacity);
+    private VisualPose pose;
+    private readonly SpringValue motionWidth = new(), motionHeight = new(), motionRadius = new();
+    private readonly SpringValue motionContent = new(), motionLabel = new(), motionHint = new();
     private bool animating;
+    private TimeSpan? lastFrame;
+    private Rect hostBounds, visibleBounds;
+    private System.Drawing.Rectangle positionedScreen;
+    private double positionedScale;
     private bool resizing;
     private Point resizeStart;
     private Size resizeSize;
     public DrawerMode Mode { get; private set; } = DrawerMode.Hidden;
     public bool IsTransferring { get; set; }
+    public Rect VisibleBounds => visibleBounds;
     public CanvasView Canvas { get; }
     private double Scale => VisualTreeHelper.GetDpi(this).DpiScaleX;
-    public EdgeWindow(App app)
+    public Size ScreenSize
     {
-        this.app = app;
+        get
+        {
+            var bounds = System.Windows.Forms.Screen.PrimaryScreen!.Bounds;
+            return new Size(bounds.Width / Scale, bounds.Height / Scale);
+        }
+    }
+    public DrawerHost Host { get; }
+    public EdgeWindow(App app, DrawerHost host)
+    {
+        this.app = app; Host = host;
         Title = "drawer";
+        Icon = AppIcon.WindowIcon;
         WindowStyle = WindowStyle.None;
         ResizeMode = ResizeMode.NoResize;
         AllowsTransparency = true;
@@ -49,7 +68,7 @@ public sealed class EdgeWindow : Window
         AllowDrop = true;
         Canvas = new(app, this);
         content = new Grid { Margin = new Thickness(14) };
-        var panel = new Border
+        panel = new Border
         {
             Background = new LinearGradientBrush(Color.FromRgb(29, 31, 35), Color.FromRgb(21, 23, 27), 90),
             BorderBrush = new SolidColorBrush(Color.FromRgb(43, 45, 51)), BorderThickness = new Thickness(1),
@@ -64,24 +83,31 @@ public sealed class EdgeWindow : Window
             Margin = new Thickness(8, 12, 8, 0), Visibility = Visibility.Collapsed, IsHitTestVisible = false
         };
         content.Children.Add(notice);
-        shell = new Border { Background = Brushes.Black, Child = content, Opacity = 0, ClipToBounds = true };
-        // The invisible sensor belongs to the HWND; the visible shell can genuinely start at 0×0.
-        Background = new SolidColorBrush(Color.FromArgb(1, 0, 0, 0));
-        Content = shell;
+        handleLabel = new HandleLabel();
+        hint = new Border { IsHitTestVisible = false, Opacity = 1 };
+        handleFrame = new Border { Child = handleLabel, IsHitTestVisible = false };
+        var shellContent = new System.Windows.Controls.Canvas(); shellContent.Children.Add(content); shellContent.Children.Add(handleFrame); shellContent.Children.Add(hint);
+        shell = new Border { Background = Brushes.Black, Child = shellContent, Opacity = 0, ClipToBounds = true };
+        RefreshLabel();
+        ApplyAppearance();
+        // Keep the native window fixed throughout each animation. Alpha-zero pixels outside
+        // the visible shell pass input through to the desktop in this layered window.
+        Background = Brushes.Transparent;
+        surface = new System.Windows.Controls.Canvas(); surface.Children.Add(shell); Content = surface;
         noticeTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2.5) };
         noticeTimer.Tick += (_, _) => { notice.Visibility = Visibility.Collapsed; noticeTimer.Stop(); };
-        timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(32) };
         timer.Tick += Tick;
         SourceInitialized += (_, _) => { Native.SetNonActivating(this, true); Position(false); timer.Start(); };
-        Closed += (_, _) => { timer.Stop(); noticeTimer.Stop(); };
-        Closing += (_, e) => { if (!app.IsExiting) { e.Cancel = true; Collapse(); } };
-        MouseEnter += (_, _) => { outside = false; if (Mode == DrawerMode.Hidden && !animating) SetMode(DrawerMode.Handle); };
+        Closed += (_, _) => { StopAnimation(); timer.Stop(); noticeTimer.Stop(); };
+        Closing += (_, e) => { if (!app.IsExiting && !retired) { e.Cancel = true; Collapse(); } };
+        MouseEnter += (_, _) => outside = false;
         PreviewMouseLeftButtonDown += OnPress;
         PreviewMouseMove += OnResize;
         PreviewMouseLeftButtonUp += (_, _) =>
         {
             if (!resizing) return;
-            resizing = false; ReleaseMouseCapture(); app.Session.Save();
+            resizing = false; ReleaseMouseCapture(); Host.Session.Save();
         };
         PreviewKeyDown += (_, e) =>
         {
@@ -102,119 +128,134 @@ public sealed class EdgeWindow : Window
         double scale = Scale;
         double left = display.Bounds.Left / scale, top = display.Bounds.Top / scale;
         double width = display.Bounds.Width / scale, height = display.Bounds.Height / scale;
-        var p = app.Session.State.Preferences;
+        var p = Host.Session.State.Preferences;
         bool expanded = mode is DrawerMode.Preview or DrawerMode.Focused;
-        double w = expanded ? Math.Clamp(p.Width, 360, Math.Min(900, Math.Max(360, width))) : p.Edge == DockEdge.Top ? 132 : mode == DrawerMode.Hidden ? 2 / scale : 15;
-        double h = expanded ? Math.Clamp(p.Height, 420, Math.Min(1000, Math.Max(420, height))) : p.Edge == DockEdge.Top ? mode == DrawerMode.Hidden ? 2 / scale : 15 : 132;
-        return p.Edge switch
-        {
-            DockEdge.Left => new(left, top + (height - h) / 2, w, h),
-            DockEdge.Right => new(left + width - w, top + (height - h) / 2, w, h),
-            _ => new(left + (width - w) / 2, top, w, h)
-        };
+        var fitted = DrawerSizing.Resolve(p, width, height);
+        double w = expanded ? fitted.Width : p.Edge == DockEdge.Top ? 132 : mode == DrawerMode.Hidden ? DockPlacement.HintThickness : DockPlacement.HandleThickness;
+        double h = expanded ? fitted.Height : p.Edge == DockEdge.Top ? mode == DrawerMode.Hidden ? DockPlacement.HintThickness : DockPlacement.HandleThickness : 132;
+        var bounds = DockPlacement.From(p).Bounds(width, height, w, h);
+        return new(left + bounds.X, top + bounds.Y, bounds.Width, bounds.Height);
     }
     public void Position(bool animate = true)
     {
-        // Keep the canvas layout stable while the outer shell changes size. Resizing the HWND
-        // must not repeatedly reflow content or move the viewport center during an animation.
+        handleLabel.Update(Host.Label, Host.Session.State.Preferences.Edge);
         var expanded = BoundsFor(DrawerMode.Focused);
         content.Width = Math.Max(1, expanded.Width - 28);
         content.Height = Math.Max(1, expanded.Height - 28);
-        content.HorizontalAlignment = HorizontalAlignment.Left;
+        content.HorizontalAlignment = Host.Session.State.Preferences.Edge == DockEdge.Right ? HorizontalAlignment.Right : HorizontalAlignment.Left;
         content.VerticalAlignment = VerticalAlignment.Top;
+        // Reserve a small spring envelope once, rather than moving/resizing the HWND per frame.
+        // All smaller docked rectangles are contained within this envelope, including at corners.
+        var display = System.Windows.Forms.Screen.PrimaryScreen!.Bounds;
+        positionedScreen = display; positionedScale = Scale;
+        var envelope = DockPlacement.From(Host.Session.State.Preferences).Bounds(display.Width / Scale, display.Height / Scale,
+            Math.Max(expanded.Width * 1.08, DockPlacement.HandleLength), Math.Max(expanded.Height * 1.08, DockPlacement.HandleLength));
+        var nextHost = AlignToPixels(new Rect(display.Left / Scale + envelope.X, display.Top / Scale + envelope.Y, envelope.Width, envelope.Height));
+        bool hostChanged = nextHost != hostBounds;
+        hostBounds = nextHost;
+        if (hostChanged) ApplyBounds(hostBounds);
+        // Layout stays fixed too: changing Width/Height during a frame can leave WPF's old
+        // arrange slot briefly visible. Only clip geometry and opacity animate below.
+        shell.Width = hint.Width = hostBounds.Width;
+        shell.Height = hint.Height = hostBounds.Height;
+        var children = (System.Windows.Controls.Canvas)shell.Child;
+        children.Width = hostBounds.Width; children.Height = hostBounds.Height;
+        System.Windows.Controls.Canvas.SetLeft(content, expanded.Left - hostBounds.Left);
+        System.Windows.Controls.Canvas.SetTop(content, expanded.Top - hostBounds.Top);
+        var handle = BoundsFor(DrawerMode.Handle);
+        handleFrame.Width = handle.Width; handleFrame.Height = handle.Height;
+        System.Windows.Controls.Canvas.SetLeft(handleFrame, handle.Left - hostBounds.Left);
+        System.Windows.Controls.Canvas.SetTop(handleFrame, handle.Top - hostBounds.Top);
         if (!animate)
         {
-            animating = false;
-            motion = MotionPhase.None;
+            StopAnimation();
             SettleVisuals();
             return;
         }
-        if (Mode == DrawerMode.Hidden)
-        {
-            // Do not hide the content here: it remains visible during the shrink/fade.
-            if (pose.ContentOpacity > 0 || pose.Width > BoundsFor(DrawerMode.Handle).Width + 1 || pose.Height > BoundsFor(DrawerMode.Handle).Height + 1)
-                BeginMotion(MotionPhase.CollapseToHandle, PoseFor(DrawerMode.Handle), 220);
-            else BeginMotion(MotionPhase.HandleOut, new(0, 0, 0, 0, 0), 100);
-        }
-        else if (Mode == DrawerMode.Handle) BeginMotion(MotionPhase.HandleIn, PoseFor(Mode), 360);
-        else BeginMotion(MotionPhase.Expand, PoseFor(Mode), 380);
+        BeginMotion();
     }
     private void ApplyBounds(Rect r) { Left = r.Left; Top = r.Top; Width = r.Width; Height = r.Height; }
+    private Rect AlignToPixels(Rect bounds)
+    {
+        double Snap(double value) => Math.Round(value * Scale) / Scale;
+        return new Rect(new Point(Snap(bounds.Left), Snap(bounds.Top)), new Point(Snap(bounds.Right), Snap(bounds.Bottom)));
+    }
     private VisualPose PoseFor(DrawerMode mode)
     {
-        if (mode == DrawerMode.Hidden) return new(0, 0, 0, 0, 0);
         var bounds = BoundsFor(mode);
         bool expanded = mode is DrawerMode.Preview or DrawerMode.Focused;
-        return new(bounds.Width, bounds.Height, expanded ? 22 : 11, 1, expanded ? 1 : 0);
+        return new(bounds.Width, bounds.Height, expanded ? 22 : 11,
+            expanded ? 1 : 0, mode == DrawerMode.Handle ? 1 : 0, mode == DrawerMode.Hidden ? 1 : 0);
     }
-    private void BeginMotion(MotionPhase phase, VisualPose target, double duration)
+    private void BeginMotion()
     {
-        fromPose = pose;
-        toPose = target;
-        motion = phase;
-        animationDuration = duration;
-        animationClock.Restart();
-        animating = true;
-        // Keep the panel alive until its fade completes, including interrupted transitions.
-        content.Visibility = fromPose.ContentOpacity > 0 || target.ContentOpacity > 0 ? Visibility.Visible : Visibility.Collapsed;
+        var target = PoseFor(Mode);
+        motionWidth.Target = target.Width; motionHeight.Target = target.Height; motionRadius.Target = target.Radius;
+        motionContent.Target = target.ContentOpacity; motionLabel.Target = target.LabelOpacity; motionHint.Target = target.HintOpacity;
+        content.Visibility = Visibility.Visible;
+        if (animating) return; // Retarget without resetting position or velocity.
+        animating = true; lastFrame = null;
+        CompositionTarget.Rendering += RenderFrame;
     }
-    private static double Spring(double t, double damping, double frequency)
+    private void StopAnimation()
     {
-        if (t <= 0) return 0;
-        if (t >= 1) return 1;
-        return 1 - Math.Exp(-damping * t) * (Math.Cos(frequency * t) + damping / frequency * Math.Sin(frequency * t));
+        CompositionTarget.Rendering -= RenderFrame;
+        animating = false; lastFrame = null;
     }
-    private void AdvanceAnimation()
+    private void RenderFrame(object? sender, EventArgs e)
     {
-        double t = Math.Clamp(animationClock.Elapsed.TotalMilliseconds / animationDuration, 0, 1);
-        double eased = motion switch
-        {
-            MotionPhase.HandleIn => Spring(t, 6.5, 10),
-            MotionPhase.Expand => Spring(t, 9.5, 10.5),
-            _ => t * t * (3 - 2 * t)
-        };
-        double fade = t * t * (3 - 2 * t);
-        static double Mix(double a, double b, double p) => a + (b - a) * p;
-        pose = new(
-            Math.Max(0, Mix(fromPose.Width, toPose.Width, eased)),
-            Math.Max(0, Mix(fromPose.Height, toPose.Height, eased)),
-            Math.Max(0, Mix(fromPose.Radius, toPose.Radius, fade)),
-            Mix(fromPose.ShellOpacity, toPose.ShellOpacity, fade),
-            Mix(fromPose.ContentOpacity, toPose.ContentOpacity, fade));
+        var time = ((RenderingEventArgs)e).RenderingTime;
+        if (lastFrame is { } previous) AdvanceAnimation((time - previous).TotalSeconds);
+        if (animating) lastFrame = time;
+    }
+    private void AdvanceAnimation(double seconds)
+    {
+        bool closing = Mode == DrawerMode.Hidden;
+        // Large panels get less overshoot, while handles retain a small elastic response.
+        double extent = Math.Max(motionWidth.Target, motionHeight.Target);
+        double damping = closing ? 1 : extent > 900 ? .94 : .86;
+        motionWidth.Step(seconds, closing ? 30 : 24, damping);
+        motionHeight.Step(seconds, closing ? 30 : 24, damping);
+        motionRadius.Step(seconds, 28, 1);
+        motionContent.Step(seconds, 28, 1);
+        motionLabel.Step(seconds, 28, 1);
+        motionHint.Step(seconds, 28, 1);
+        pose = new(motionWidth.Value, motionHeight.Value, motionRadius.Value, motionContent.Value, motionLabel.Value, motionHint.Value);
         DrawPose();
-        if (t < 1) return;
-        if (motion == MotionPhase.CollapseToHandle)
+        if (motionWidth.IsSettled(.04) && motionHeight.IsSettled(.04) && motionRadius.IsSettled(.01) &&
+            motionContent.IsSettled(.001) && motionLabel.IsSettled(.001) && motionHint.IsSettled(.001))
         {
-            BeginMotion(MotionPhase.HandleOut, new(0, 0, 0, 0, 0), 100);
-            return;
+            StopAnimation(); SettleVisuals();
         }
-        animating = false;
-        motion = MotionPhase.None;
-        SettleVisuals();
     }
     private void DrawPose()
     {
-        var anchor = BoundsFor(DrawerMode.Handle);
-        double width = Math.Max(1 / Scale, pose.Width), height = Math.Max(1 / Scale, pose.Height);
-        var edge = app.Session.State.Preferences.Edge;
-        var bounds = edge switch
+        var display = System.Windows.Forms.Screen.PrimaryScreen!.Bounds;
+        var placement = DockPlacement.From(Host.Session.State.Preferences).Bounds(display.Width / Scale, display.Height / Scale,
+            Math.Clamp(pose.Width, 1 / Scale, hostBounds.Width), Math.Clamp(pose.Height, 1 / Scale, hostBounds.Height));
+        double width = placement.Width, height = placement.Height;
+        var edge = Host.Session.State.Preferences.Edge;
+        double x = display.Left / Scale + placement.X - hostBounds.Left;
+        double y = display.Top / Scale + placement.Y - hostBounds.Top;
+        visibleBounds = AlignToPixels(new Rect(x, y, width, height));
+        x = visibleBounds.X; y = visibleBounds.Y; width = visibleBounds.Width; height = visibleBounds.Height;
+        // Only the two outward corners are rounded: their radius may use the full
+        // thickness, so a retracted handle keeps its curve instead of becoming a flat strip.
+        double maximumRadius = edge == DockEdge.Top ? Math.Min(height, width / 2) : Math.Min(width, height / 2);
+        double radius = Math.Min(pose.Radius, maximumRadius);
+        var corners = edge switch
         {
-            DockEdge.Left => new Rect(anchor.Left, anchor.Top + anchor.Height / 2 - height / 2, width, height),
-            DockEdge.Right => new Rect(anchor.Right - width, anchor.Top + anchor.Height / 2 - height / 2, width, height),
-            _ => new Rect(anchor.Left + anchor.Width / 2 - width / 2, anchor.Top, width, height)
+            DockEdge.Top => new CornerRadius(0, 0, radius, radius),
+            DockEdge.Left => new CornerRadius(0, radius, radius, 0),
+            _ => new CornerRadius(radius, 0, 0, radius)
         };
-        ApplyBounds(bounds);
-        double radius = Math.Min(pose.Radius, Math.Min(width, height) / 2);
-        shell.CornerRadius = edge switch
-        {
-            DockEdge.Top => new(0, 0, radius, radius),
-            DockEdge.Left => new(0, radius, radius, 0),
-            _ => new(radius, 0, 0, radius)
-        };
-        shell.Opacity = Math.Clamp(pose.ShellOpacity, 0, 1);
+        shell.Opacity = 1;
         content.Opacity = Math.Clamp(pose.ContentOpacity, 0, 1);
-        // Clip the fixed-size canvas to the moving outline, including the interior round corners.
-        shell.Clip = Outline(width, height, shell.CornerRadius);
+        handleLabel.Opacity = Math.Clamp(pose.LabelOpacity, 0, 1);
+        hint.Opacity = Math.Clamp(pose.HintOpacity, 0, 1);
+        var clip = Outline(width, height, corners).Clone();
+        clip.Transform = new TranslateTransform(x, y); clip.Freeze();
+        shell.Clip = clip;
     }
     private static Geometry Outline(double width, double height, CornerRadius radius)
     {
@@ -237,31 +278,30 @@ public sealed class EdgeWindow : Window
     private void SettleVisuals()
     {
         pose = PoseFor(Mode);
+        motionWidth.Snap(pose.Width); motionHeight.Snap(pose.Height); motionRadius.Snap(pose.Radius);
+        motionContent.Snap(pose.ContentOpacity); motionLabel.Snap(pose.LabelOpacity); motionHint.Snap(pose.HintOpacity);
         content.Visibility = Mode is DrawerMode.Preview or DrawerMode.Focused ? Visibility.Visible : Visibility.Collapsed;
-        if (Mode == DrawerMode.Hidden)
-        {
-            shell.Opacity = 0;
-            content.Opacity = 0;
-            shell.Clip = null;
-            ApplyBounds(BoundsFor(DrawerMode.Hidden));
-        }
-        else DrawPose();
+        DrawPose();
     }
     private void Tick(object? sender, EventArgs e)
     {
-        if (animating) AdvanceAnimation();
-        if (Mode == DrawerMode.Hidden || IsTransferring || resizing || Canvas.HasActiveInteraction || animating)
+        if (positionedScreen != System.Windows.Forms.Screen.PrimaryScreen!.Bounds || positionedScale != Scale) Position(false);
+        if (IsTransferring || resizing || Canvas.HasActiveInteraction)
         {
-            // After a gesture/menu finishes, give the pointer a fresh leave delay.
             outside = false;
             return;
         }
         Native.GetCursorPos(out var pt);
+        if (Mode == DrawerMode.Hidden)
+        {
+            // Only the resting hint reopens a collapsing tray; the shrinking panel is not a trigger.
+            if (BoundsFor(DrawerMode.Hidden).Contains(new Point(pt.X / Scale, pt.Y / Scale))) SetMode(DrawerMode.Handle);
+            outside = false;
+            return;
+        }
         var pointer = PointFromScreen(new Point(pt.X, pt.Y));
-        bool inside = new Rect(0, 0, ActualWidth, ActualHeight).Contains(pointer);
+        bool inside = visibleBounds.Contains(pointer);
         if (inside) { outside = false; focusedPointerEntered = true; return; }
-        // A launch/notification can open the drawer while the pointer is elsewhere.
-        // Auto-hide begins after the user has actually entered and then left it.
         if (Mode == DrawerMode.Focused && !focusedPointerEntered) return;
         if (!outside) { outside = true; outsideSince = DateTime.UtcNow; }
         if ((DateTime.UtcNow - outsideSince).TotalMilliseconds > (Mode == DrawerMode.Handle ? 240 : 320))
@@ -270,6 +310,7 @@ public sealed class EdgeWindow : Window
     private void SetMode(DrawerMode mode)
     {
         if (Mode == mode) return;
+        if (mode is DrawerMode.Focused or DrawerMode.Preview) app.BeforeOpen(this);
         bool wasExpanded = Mode is DrawerMode.Preview or DrawerMode.Focused;
         Mode = mode;
         outside = false;
@@ -281,10 +322,29 @@ public sealed class EdgeWindow : Window
     }
     public void OpenFocused()
     {
+        if (app.IsPositionEditing) { app.OpenSettings(); return; }
         SetMode(DrawerMode.Focused);
         Canvas.RefreshFiles();
         Activate();
         Canvas.Focus();
+    }
+    public void SuspendForPositionEdit()
+    {
+        Collapse();
+        Position(false);
+        dragOver = false;
+        Canvas.DropPoint = null;
+        resizing = false;
+        ReleaseMouseCapture();
+        timer.Stop();
+        Hide();
+    }
+    public void ResumeAfterPositionEdit()
+    {
+        Mode = DrawerMode.Hidden;
+        Position(false);
+        Show();
+        timer.Start();
     }
     public void Collapse()
     {
@@ -297,15 +357,27 @@ public sealed class EdgeWindow : Window
     {
         notice.Text = text; notice.Visibility = Visibility.Visible; noticeTimer.Stop(); noticeTimer.Start();
     }
+    public void RefreshLabel() { Title = "drawer · " + Host.Label; handleLabel.Update(Host.Label, Host.Session.State.Preferences.Edge); ToolTip = Host.Label; }
+    public void ApplyAppearance()
+    {
+        var palette = DrawerPalette.For(Host.Session.State.Preferences.Theme);
+        hint.Background = palette.Shell;
+        shell.Background = palette.Shell; panel.Background = palette.Surface; panel.BorderBrush = palette.Border;
+        handleLabel.Foreground = palette.Ink; notice.Foreground = palette.Ink; notice.Background = palette.Editor;
+        Canvas.ApplyAppearance();
+    }
+    public void CloseDrawer() { retired = true; Canvas.Stop(); Close(); }
+    public void RetractForExport() => SetMode(DrawerMode.Hidden);
     private void OnPress(object sender, MouseButtonEventArgs e)
     {
         if (Mode != DrawerMode.Focused) { OpenFocused(); e.Handled = true; return; }
-        Point point = e.GetPosition(this);
-        if (point.X < 8 || point.X > ActualWidth - 8 || point.Y > ActualHeight - 8)
+        Point inWindow = e.GetPosition(this);
+        var point = new Point(inWindow.X - visibleBounds.X, inWindow.Y - visibleBounds.Y);
+        if (point.X < 8 || point.X > visibleBounds.Width - 8 || point.Y > visibleBounds.Height - 8)
         {
             resizing = true;
-            resizeStart = PointToScreen(point);
-            resizeSize = new(Width, Height);
+            resizeStart = PointToScreen(inWindow);
+            resizeSize = visibleBounds.Size;
             CaptureMouse();
             e.Handled = true;
         }
@@ -314,17 +386,19 @@ public sealed class EdgeWindow : Window
     {
         if (!resizing) return;
         var point = PointToScreen(e.GetPosition(this));
-        var p = app.Session.State.Preferences;
+        var p = Host.Session.State.Preferences;
         double dx = (point.X - resizeStart.X) / Scale, dy = (point.Y - resizeStart.Y) / Scale;
-        p.Width = Math.Clamp(resizeSize.Width + dx * (p.Edge == DockEdge.Right ? -1 : p.Edge == DockEdge.Top ? 2 : 1), 360, 900);
-        p.Height = Math.Clamp(resizeSize.Height + dy * (p.Edge == DockEdge.Top ? 1 : 2), 420, 1000);
+        var screen = ScreenSize;
+        double width = resizeSize.Width + dx * (p.Edge == DockEdge.Right ? -1 : p.Edge == DockEdge.Top ? 2 : 1);
+        double height = resizeSize.Height + dy * (p.Edge == DockEdge.Top ? 1 : 2);
+        DrawerSizing.SetPercentages(p, Math.Clamp(Math.Round(width / screen.Width * 100), 10, 90), Math.Clamp(Math.Round(height / screen.Height * 100), 10, 90));
         Position(false);
         e.Handled = true;
     }
     private void OnDragOver(object sender, DragEventArgs e)
     {
         e.Handled = true;
-        if (app.Transfer.IsOwn(e.Data)) { e.Effects = DragDropEffects.None; Canvas.DropPoint = null; return; }
+        if (app.Transfer.IsFromDrawer(e.Data, Host.Id)) { e.Effects = DragDropEffects.None; Canvas.DropPoint = null; return; }
         dragOver = true;
         outside = false;
         if (Mode != DrawerMode.Focused) SetMode(DrawerMode.Preview);
@@ -338,14 +412,14 @@ public sealed class EdgeWindow : Window
         e.Handled = true;
         dragOver = false;
         Canvas.DropPoint = null;
-        if (app.Transfer.IsOwn(e.Data) || (e.AllowedEffects & DragDropEffects.Copy) == 0) { e.Effects = DragDropEffects.None; return; }
+        if (app.Transfer.IsFromDrawer(e.Data, Host.Id) || (e.AllowedEffects & DragDropEffects.Copy) == 0) { e.Effects = DragDropEffects.None; return; }
         var point = e.GetPosition(Canvas);
         if (!new Rect(0, 0, Canvas.ActualWidth, Canvas.ActualHeight).Contains(point)) { e.Effects = DragDropEffects.None; return; }
         try
         {
             var items = app.Transfer.Read(e.Data);
             Canvas.MeasureItems(items);
-            app.Session.Insert(items, Canvas.ToCell(point));
+            Host.Session.Insert(items, Canvas.ToCell(point));
             e.Effects = items.Count > 0 ? DragDropEffects.Copy : DragDropEffects.None;
             if (items.Count == 0) Notify("无法识别拖入内容");
         }

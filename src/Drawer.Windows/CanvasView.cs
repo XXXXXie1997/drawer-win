@@ -14,12 +14,13 @@ public sealed class CanvasView : Panel
 {
     private readonly App app;
     private readonly EdgeWindow window;
-    private DrawerSession Session => app.Session;
+    private DrawerSession Session => window.Host.Session;
     private DrawerState State => Session.State;
     private static readonly Typeface Font = new("Segoe UI");
-    private static readonly Brush Ink = new SolidColorBrush(Color.FromRgb(225, 229, 237));
-    private static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(120, 172, 255));
-    private static readonly Brush Muted = new SolidColorBrush(Color.FromRgb(148, 157, 174));
+    private DrawerPalette Palette => DrawerPalette.For(State.Preferences.Theme);
+    private Brush Ink => Palette.Ink;
+    private Brush Accent => Palette.Accent;
+    private Brush Muted => Palette.Muted;
     private readonly Dictionary<Guid, ImageSource?> images = [];
     private readonly HashSet<Guid> loadingImages = [];
     private readonly Dictionary<Guid, bool> missingFiles = [];
@@ -100,7 +101,7 @@ public sealed class CanvasView : Panel
         dc.PushClip(new RectangleGeometry(new Rect(RenderSize), 13, 13));
         var v = State.Viewport;
         double step = 28 * v.Zoom;
-        var dot = new SolidColorBrush(Color.FromRgb(55, 59, 66));
+        var dot = Palette.Dot;
         for (double x = ((v.OffsetX % step) + step) % step; x < ActualWidth; x += step)
             for (double y = ((v.OffsetY % step) + step) % step; y < ActualHeight; y += step)
                 dc.DrawEllipse(dot, null, new(x, y), Math.Clamp(v.Zoom * .75, .6, 1), Math.Clamp(v.Zoom * .75, .6, 1));
@@ -131,7 +132,7 @@ public sealed class CanvasView : Panel
             dc.DrawLine(new Pen(Brushes.White, 1.5), new(center.X + 3, center.Y - 3), new(center.X - 3, center.Y + 3));
         }
         if (gesture == "marquee" && moved)
-            dc.DrawRectangle(new SolidColorBrush(Color.FromArgb(30, 120, 172, 255)), new Pen(Accent, 1), marquee);
+            dc.DrawRectangle(Palette.Selection, new Pen(Accent, 1), marquee);
         if ((DropPoint ?? State.InsertionPoint) is Cell point)
         {
             var p = Screen(new Point(point.X * 28, point.Y * 28));
@@ -146,9 +147,9 @@ public sealed class CanvasView : Panel
         var r = WorldRect(frame);
         r.Inflate(-2, -2);
         bool selected = Session.Selection.Contains(item.Id);
-        var fill = new SolidColorBrush(Color.FromArgb(item.Kind == ItemKind.Text ? (byte)12 : (byte)28, 160, 177, 201));
-        dc.DrawRoundedRectangle(fill, selected ? new Pen(Accent, 2 / State.Viewport.Zoom) : item.Kind == ItemKind.Text ? null : new Pen(new SolidColorBrush(Color.FromArgb(20, 200, 210, 230)), 1), r, 11, 11);
-        if (selected) dc.DrawRoundedRectangle(new SolidColorBrush(Color.FromArgb(14, 120, 172, 255)), null, r, 11, 11);
+        var fill = Palette.Card;
+        dc.DrawRoundedRectangle(fill, selected ? new Pen(Accent, 2 / State.Viewport.Zoom) : item.Kind == ItemKind.Text ? null : new Pen(Palette.Border, 1), r, 11, 11);
+        if (selected) dc.DrawRoundedRectangle(Palette.Selection, null, r, 11, 11);
         if (item.Id == editId) return;
         if (item.Kind == ItemKind.Text)
         {
@@ -212,6 +213,11 @@ public sealed class CanvasView : Panel
         InvalidateVisual();
     }
     public void RefreshFiles() { images.Clear(); missingFiles.Clear(); InvalidateVisual(); }
+    public void ApplyAppearance()
+    {
+        if (editor is not null) { editor.Foreground = Ink; editor.Background = Palette.Editor; }
+        InvalidateVisual();
+    }
     private void OnMouseDown(object sender, MouseButtonEventArgs e)
     {
         if (editor is not null && IsInsideEditor(e.OriginalSource as DependencyObject)) return;
@@ -232,7 +238,7 @@ public sealed class CanvasView : Panel
         {
             if (e.ClickCount == 2)
             {
-                Session.Selection.Clear(); Session.Selection.Add(hit.Id);
+                Session.Selection.Clear(); Session.Selection.Add(hit.Id); Session.UpdateInsertionFromSelection(hit.Id);
                 if (hit.Kind == ItemKind.Text) BeginEdit(hit, pressPoint);
                 else if (hit.Kind == ItemKind.FileReference) OpenFile(hit, false);
                 e.Handled = true; return;
@@ -241,7 +247,8 @@ public sealed class CanvasView : Panel
             {
                 if (!Session.Selection.Remove(hit.Id)) Session.Selection.Add(hit.Id);
             }
-            else if (!Session.Selection.Contains(hit.Id)) { Session.Selection.Clear(); Session.Selection.Add(hit.Id); }
+            else if (!Session.Selection.Contains(hit.Id)) { Session.Selection.Clear(); Session.Selection.Add(hit.Id); Session.UpdateInsertionFromSelection(hit.Id); }
+            Session.UpdateInsertionFromSelection(hit.Id);
             if (Session.Selection.Contains(hit.Id)) { gesture = "move"; moveDelta = default; CaptureMouse(); }
         }
         else
@@ -277,7 +284,7 @@ public sealed class CanvasView : Panel
                 if (!moved) break;
                 moveDelta = ToCell(p) - pressCell;
                 Point inWindow = TranslatePoint(p, window);
-                var border = new Rect(-8, -8, window.ActualWidth + 16, window.ActualHeight + 16);
+                var border = window.VisibleBounds; border.Inflate(8, 8);
                 if (!border.Contains(inWindow)) { StartExport(); return; }
                 break;
             case "marquee":
@@ -304,6 +311,7 @@ public sealed class CanvasView : Panel
         Cursor = Cursors.Arrow;
         if (current == "move" && moved) Session.Move(moveDelta);
         if (current == "pan") { if (moved) Session.Save(); else ShowMenu(e.GetPosition(this)); }
+        if (current == "marquee" && moved) Session.UpdateInsertionFromSelection();
         if (current == "marquee" && !moved) { State.InsertionPoint = pressCell; Session.Save(); }
         moveDelta = default;
         InvalidateVisual();
@@ -314,6 +322,7 @@ public sealed class CanvasView : Panel
         if (gesture == "pan") { State.Viewport.OffsetX = panOrigin.X; State.Viewport.OffsetY = panOrigin.Y; }
         gesture = null; moveDelta = default; ReleaseMouseCapture(); Cursor = Cursors.Arrow; InvalidateVisual();
     }
+    public void Stop() { viewportSave.Stop(); CancelGesture(); }
     private void StartExport()
     {
         gesture = null; moveDelta = default;
@@ -321,8 +330,9 @@ public sealed class CanvasView : Panel
         window.IsTransferring = true;
         try
         {
-            var output = app.Transfer.Build(State.Items.Where(i => Session.Selection.Contains(i.Id)), true);
+            var output = app.Transfer.Build(State.Items.Where(i => Session.Selection.Contains(i.Id)), true, window.Host.Id);
             if (output.Exported.Count == 0) { window.Notify("没有可输出的内容"); return; }
+            window.RetractForExport();
             var result = DragDrop.DoDragDrop(this, output.Data, DragDropEffects.Copy);
             if (result == DragDropEffects.None) window.Notify("未放入目标，内容仍在抽屉中");
         }
@@ -359,7 +369,7 @@ public sealed class CanvasView : Panel
         {
             switch (e.Key)
             {
-                case Key.A: Session.Selection.UnionWith(State.Items.Select(i => i.Id)); Session.Refresh(); break;
+                case Key.A: Session.Selection.UnionWith(State.Items.Select(i => i.Id)); Session.UpdateInsertionFromSelection(); Session.Refresh(); break;
                 case Key.C: Copy(false); break;
                 case Key.X: Copy(true); break;
                 case Key.V: Paste(); break;
@@ -403,7 +413,7 @@ public sealed class CanvasView : Panel
         editor = new TextBox
         {
             Text = item.Text, FontFamily = new FontFamily("Segoe UI"), FontSize = 14,
-            Foreground = Ink, Background = new SolidColorBrush(Color.FromRgb(29, 32, 39)),
+            Foreground = Ink, Background = Palette.Editor,
             BorderThickness = new Thickness(0), Padding = new Thickness(6, 3, 6, 3),
             AcceptsReturn = true, AcceptsTab = true, TextWrapping = TextWrapping.Wrap,
             VerticalScrollBarVisibility = ScrollBarVisibility.Hidden, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
@@ -516,14 +526,47 @@ public sealed class CanvasView : Panel
         v.OffsetY = ActualHeight / 2 - (bounds.Y + bounds.Height / 2) * v.Zoom;
         Session.Save(); InvalidateVisual();
     }
+    private void ExecuteCommand(DrawerCommand command)
+    {
+        switch (command)
+        {
+            case DrawerCommand.FitAll: FitAll(); break;
+            case DrawerCommand.ReturnToPoint:
+                if (State.InsertionPoint is not Cell cell) return;
+                State.Viewport.OffsetX = ActualWidth / 2 - cell.X * 28 * State.Viewport.Zoom;
+                State.Viewport.OffsetY = ActualHeight / 2 - cell.Y * 28 * State.Viewport.Zoom;
+                Session.Save(); InvalidateVisual(); break;
+            case DrawerCommand.ResetZoom:
+                var center = World(new(ActualWidth / 2, ActualHeight / 2));
+                State.Viewport.Zoom = 1; State.Viewport.OffsetX = ActualWidth / 2 - center.X; State.Viewport.OffsetY = ActualHeight / 2 - center.Y;
+                Session.Save(); InvalidateVisual(); break;
+            case DrawerCommand.OpenSelected:
+            case DrawerCommand.RevealSelected:
+                if (Session.Selection.Count == 1 && State.Items.SingleOrDefault(i => Session.Selection.Contains(i.Id)) is { Kind: ItemKind.FileReference } item)
+                    OpenFile(item, command == DrawerCommand.RevealSelected);
+                break;
+            case DrawerCommand.OpenSettings: app.OpenSettings(); break;
+            case DrawerCommand.ClearDrawer:
+                if (State.Items.Count == 0) return;
+                modalOpen = true;
+                try
+                {
+                    if (MessageBox.Show(window, "文字和截图会从抽屉移除。\n文件只移除引用，不修改源文件。\n\n此操作可以撤销。", "清空抽屉", MessageBoxButton.OKCancel, MessageBoxImage.Question) == MessageBoxResult.OK)
+                        Session.Remove(State.Items.Select(i => i.Id).ToArray());
+                }
+                finally { modalOpen = false; }
+                break;
+            case DrawerCommand.ExitApp: app.ExitApp(); break;
+        }
+    }
     private void ShowMenu(Point point)
     {
         var hit = Hit(point);
-        if (hit is not null && !Session.Selection.Contains(hit.Id)) { Session.Selection.Clear(); Session.Selection.Add(hit.Id); Session.Refresh(); }
+        if (hit is not null && !Session.Selection.Contains(hit.Id)) { Session.Selection.Clear(); Session.Selection.Add(hit.Id); Session.UpdateInsertionFromSelection(hit.Id); Session.Refresh(); }
         var menu = new ContextMenu();
         menu.Opened += (_, _) => contextMenuOpen = true;
         menu.Closed += (_, _) => contextMenuOpen = false;
-        void Add(string name, Action action, bool enabled = true)
+        void Add(string name, Action action, bool enabled = true, DrawerCommand? command = null)
         {
             var item = new MenuItem { Header = name, IsEnabled = enabled };
             item.Click += (_, _) => action(); menu.Items.Add(item);
@@ -535,22 +578,22 @@ public sealed class CanvasView : Panel
             if (hit?.Kind == ItemKind.FileReference)
             {
                 bool valid = app.Files.Resolve(hit) is not null;
-                Add("打开", () => OpenFile(hit, false), valid);
-                Add("在文件管理器中显示", () => OpenFile(hit, true), valid);
+                Add("打开", () => OpenFile(hit, false), valid, DrawerCommand.OpenSelected);
+                Add("在文件管理器中显示", () => OpenFile(hit, true), valid, DrawerCommand.RevealSelected);
             }
             menu.Items.Add(new Separator());
         }
         Add("粘贴", Paste);
         Add("撤销", Session.Undo, Session.CanUndo); Add("重做", Session.Redo, Session.CanRedo);
         menu.Items.Add(new Separator());
-        Add("显示全部", FitAll, State.Items.Count > 0);
-        Add("回到落点", () =>
+        void Command(DrawerCommand command, bool enabled = true)
         {
-            if (State.InsertionPoint is not Cell cell) return;
-            State.Viewport.OffsetX = ActualWidth / 2 - cell.X * 28 * State.Viewport.Zoom;
-            State.Viewport.OffsetY = ActualHeight / 2 - cell.Y * 28 * State.Viewport.Zoom;
-            Session.Save(); InvalidateVisual();
-        }, State.InsertionPoint is not null);
+            var item = new MenuItem { Header = DrawerCommands.Label(command), IsEnabled = enabled };
+            item.Click += (_, _) => ExecuteCommand(command); menu.Items.Add(item);
+        }
+        Command(DrawerCommand.FitAll, State.Items.Count > 0);
+        Command(DrawerCommand.ReturnToPoint, State.InsertionPoint is not null);
+        Command(DrawerCommand.ResetZoom);
         var rule = new MenuItem { Header = "框选方式" };
         foreach (var (name, contain) in new[] { ("相交即选中", false), ("完全包含才选中", true) })
         {
@@ -559,17 +602,8 @@ public sealed class CanvasView : Panel
             rule.Items.Add(option);
         }
         menu.Items.Add(rule);
-        Add("清空抽屉…", () =>
-        {
-            modalOpen = true;
-            try
-            {
-                if (MessageBox.Show(window, "文字和截图会从抽屉移除。\n文件只移除引用，不修改源文件。\n\n此操作可以撤销。", "清空抽屉", MessageBoxButton.OKCancel, MessageBoxImage.Question) == MessageBoxResult.OK)
-                    Session.Remove(State.Items.Select(i => i.Id).ToArray());
-            }
-            finally { modalOpen = false; }
-        }, State.Items.Count > 0);
-        menu.Items.Add(new Separator()); Add("退出 drawer", app.ExitApp);
+        Command(DrawerCommand.ClearDrawer, State.Items.Count > 0);
+        menu.Items.Add(new Separator()); Command(DrawerCommand.OpenSettings); Command(DrawerCommand.ExitApp);
         menu.PlacementTarget = this; menu.IsOpen = true;
     }
     private void OpenFile(DrawerItem item, bool reveal)
